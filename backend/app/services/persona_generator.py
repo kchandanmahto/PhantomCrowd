@@ -1,3 +1,5 @@
+import json
+
 from openai import AsyncOpenAI
 
 from app.core.config import settings
@@ -66,7 +68,31 @@ async def generate_personas(
 
         text = response.choices[0].message.content
         batch_personas = extract_json(text)
-        personas.extend(batch_personas)
+
+        # Ensure we got a list of dicts
+        if isinstance(batch_personas, dict):
+            batch_personas = [batch_personas]
+        if not isinstance(batch_personas, list):
+            raise ValueError(f"Expected list of personas, got {type(batch_personas)}")
+
+        # Validate and fix each persona
+        valid = []
+        for p in batch_personas:
+            if not isinstance(p, dict):
+                continue
+            # Ensure required fields
+            p.setdefault("name", f"Persona {len(personas) + len(valid) + 1}")
+            p.setdefault("age", 25)
+            p.setdefault("gender", "non-binary")
+            p.setdefault("occupation", "Unknown")
+            if isinstance(p.get("interests"), str):
+                p["interests"] = [i.strip() for i in p["interests"].split(",")]
+            p.setdefault("interests", ["general"])
+            p.setdefault("personality", "Average person")
+            p.setdefault("social_media_usage", "moderate")
+            valid.append(p)
+
+        personas.extend(valid)
         remaining -= batch
 
     return personas[:count]

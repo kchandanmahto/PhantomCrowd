@@ -27,14 +27,15 @@ Content: {content}
 
 React to this content AS THIS PERSONA. Be authentic to the persona's background, age, interests, and personality.
 {language_instruction}
-Return ONLY a JSON object:
-{{
-  "sentiment": "positive" | "negative" | "neutral" | "mixed",
-  "sentiment_score": <float from -1.0 to 1.0>,
-  "comment": "<a realistic comment this person would write, in their natural voice and language style>",
-  "engagement": "like" | "share" | "ignore" | "dislike",
-  "reasoning": "<brief internal reasoning for their reaction>"
-}}"""
+Return ONLY valid JSON with these exact keys:
+- "sentiment": one of "positive", "negative", "neutral", "mixed"
+- "sentiment_score": a number between -1.0 and 1.0
+- "comment": a realistic comment this person would write
+- "engagement": one of "like", "share", "ignore", "dislike"
+- "reasoning": brief internal reasoning
+
+Example format:
+{{"sentiment": "positive", "sentiment_score": 0.7, "comment": "Great post!", "engagement": "like", "reasoning": "I found it interesting"}}"""
 
 ANALYSIS_PROMPT = """Analyze the following audience simulation results and provide a summary.
 
@@ -100,7 +101,7 @@ async def _generate_single_reaction(
 
     response = await client.chat.completions.create(
         model=settings.llm_model,
-        max_tokens=1024,
+        max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -201,20 +202,27 @@ async def run_simulation(simulation_id: str, db: AsyncSession):
             )
 
             for persona, reaction in zip(batch, batch_results):
+                # Clean surrogate characters that break SQLite/UTF-8
+                comment = reaction.get("comment", "").encode("utf-8", errors="replace").decode("utf-8")
+                reasoning = (reaction.get("reasoning") or "").encode("utf-8", errors="replace").decode("utf-8")
                 reaction_obj = Reaction(
                     simulation_id=simulation_id,
                     persona_name=persona["name"],
                     persona_profile=persona,
                     sentiment=reaction["sentiment"],
                     sentiment_score=reaction["sentiment_score"],
-                    comment=reaction["comment"],
+                    comment=comment,
                     engagement=reaction["engagement"],
-                    reasoning=reaction.get("reasoning"),
+                    reasoning=reasoning,
                 )
                 db.add(reaction_obj)
                 all_reactions.append(reaction)
 
-            await db.commit()
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
         # Step 3: Analyze results
         analysis = await _analyze_results(client, sim.content, all_reactions)
@@ -227,8 +235,12 @@ async def run_simulation(simulation_id: str, db: AsyncSession):
         await db.commit()
 
     except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         sim.status = "failed"
-        sim.summary = str(e)
+        sim.summary = str(e)[:500]
         await db.commit()
     finally:
         simulation_progress.pop(simulation_id, None)
