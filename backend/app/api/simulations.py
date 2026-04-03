@@ -33,7 +33,14 @@ async def create_simulation(req: SimulationCreate, db: AsyncSession = Depends(ge
     )
     db.add(sim)
     await db.commit()
-    await db.refresh(sim)
+
+    # Re-fetch with eager loading to avoid lazy load in async context
+    result = await db.execute(
+        select(Simulation)
+        .options(selectinload(Simulation.reactions))
+        .where(Simulation.id == sim.id)
+    )
+    sim = result.scalar_one()
 
     asyncio.create_task(_run_simulation_background(sim.id))
 

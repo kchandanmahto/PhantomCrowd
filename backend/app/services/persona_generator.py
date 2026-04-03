@@ -1,7 +1,7 @@
-import json
-import anthropic
+from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.services.json_utils import extract_json
 
 PERSONA_GENERATION_PROMPT = """You are a demographic and psychographic persona generator.
 Generate {count} diverse, realistic audience personas for evaluating the following content:
@@ -24,6 +24,13 @@ Ensure diversity in age, gender, occupation, and personality types.
 Return ONLY a JSON array of persona objects, no other text."""
 
 
+def _get_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+    )
+
+
 async def generate_personas(
     content: str,
     content_type: str,
@@ -34,15 +41,15 @@ async def generate_personas(
     if audience_config:
         config_text = f"Audience targeting: {json.dumps(audience_config)}"
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = _get_client()
 
     personas = []
     remaining = count
 
     while remaining > 0:
         batch = min(remaining, 20)
-        response = await client.messages.create(
-            model=settings.analysis_model,
+        response = await client.chat.completions.create(
+            model=settings.llm_analysis_model,
             max_tokens=4096,
             messages=[
                 {
@@ -57,12 +64,8 @@ async def generate_personas(
             ],
         )
 
-        text = response.content[0].text
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-
-        batch_personas = json.loads(text)
+        text = response.choices[0].message.content
+        batch_personas = extract_json(text)
         personas.extend(batch_personas)
         remaining -= batch
 

@@ -6,7 +6,7 @@ PhantomCrowd summons a crowd of AI-powered personas that react to your content l
 
 ![Python](https://img.shields.io/badge/Python-3.12+-blue)
 ![Vue](https://img.shields.io/badge/Vue-3-green)
-![Claude](https://img.shields.io/badge/Powered%20by-Claude-blueviolet)
+![LLM](https://img.shields.io/badge/LLM-Any%20OpenAI--compatible-blueviolet)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ## How It Works
@@ -35,7 +35,7 @@ Your Content → 👻 Phantom Personas Generated → 💬 Each Reacts Independen
 ### Prerequisites
 - Python 3.12+
 - Node.js 20+
-- [Anthropic API Key](https://console.anthropic.com/)
+- Any OpenAI-compatible API key (OpenAI, Ollama, Groq, Anthropic, etc.)
 
 ### 1. Clone & Setup Backend
 
@@ -112,16 +112,31 @@ PhantomCrowd/
 | GET | `/api/simulations/{id}/progress` | Poll simulation progress |
 | DELETE | `/api/simulations/{id}` | Delete simulation |
 
-## Cost Estimation
+## Supported LLM Providers
 
-PhantomCrowd uses Claude Haiku for persona reactions (cheap & fast) and Claude Sonnet for analysis (high quality).
+PhantomCrowd works with **any OpenAI-compatible API**. Configure via environment variables:
 
-| Audience Size | Estimated Cost |
-|---------------|---------------|
-| 10 personas | ~$0.02 |
-| 50 personas | ~$0.08 |
-| 100 personas | ~$0.15 |
-| 200 personas | ~$0.30 |
+| Provider | Base URL | Models |
+|----------|----------|--------|
+| **OpenAI** | `https://api.openai.com/v1` | gpt-4o-mini, gpt-4o |
+| **Ollama** (free, local) | `http://localhost:11434/v1` | llama3.1, qwen2.5 |
+| **Groq** (fast) | `https://api.groq.com/openai/v1` | llama-3.1-8b-instant |
+| **Together AI** | `https://api.together.xyz/v1` | meta-llama/Llama-3.1-8B |
+| **Anthropic** | `https://api.anthropic.com/v1` | claude-haiku, claude-sonnet |
+
+### Free Local Setup with Ollama
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.1
+
+# Set .env
+PC_LLM_BASE_URL=http://localhost:11434/v1
+PC_LLM_API_KEY=ollama
+PC_LLM_MODEL=llama3.1
+PC_LLM_ANALYSIS_MODEL=llama3.1
+```
 
 ## Roadmap
 
@@ -129,7 +144,6 @@ PhantomCrowd uses Claude Haiku for persona reactions (cheap & fast) and Claude S
 - [ ] A/B testing — compare multiple content versions
 - [ ] Custom persona templates (target specific demographics)
 - [ ] Export reports (PDF, CSV)
-- [ ] Ollama support for local/free inference
 - [ ] Multi-language audience simulation
 - [ ] Historical trend analysis
 
@@ -139,4 +153,4 @@ MIT
 
 ---
 
-Built with Claude API by Anthropic
+Works with any OpenAI-compatible LLM API

@@ -2,12 +2,13 @@ import json
 import asyncio
 from datetime import datetime
 
-import anthropic
+from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.simulation import Simulation, Reaction
 from app.services.persona_generator import generate_personas
+from app.services.json_utils import extract_json
 
 REACTION_PROMPT = """You are simulating a real person's reaction to content on social media.
 
@@ -63,34 +64,38 @@ Return ONLY a JSON object:
 simulation_progress: dict[str, dict] = {}
 
 
+def _get_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+    )
+
+
 async def _generate_single_reaction(
-    client: anthropic.AsyncAnthropic,
+    client: AsyncOpenAI,
     persona: dict,
     content: str,
     content_type: str,
 ) -> dict:
+    persona_copy = {**persona, "interests": ", ".join(persona["interests"])}
     prompt = REACTION_PROMPT.format(
         content_type=content_type,
         content=content,
-        **persona,
-        interests=", ".join(persona["interests"]),
+        **persona_copy,
     )
 
-    response = await client.messages.create(
-        model=settings.persona_model,
+    response = await client.chat.completions.create(
+        model=settings.llm_model,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-
-    return json.loads(text)
+    text = response.choices[0].message.content
+    return extract_json(text)
 
 
 async def _generate_batch_reactions(
-    client: anthropic.AsyncAnthropic,
+    client: AsyncOpenAI,
     personas: list[dict],
     content: str,
     content_type: str,
@@ -110,7 +115,7 @@ async def _generate_batch_reactions(
 
 
 async def _analyze_results(
-    client: anthropic.AsyncAnthropic,
+    client: AsyncOpenAI,
     content: str,
     reactions: list[dict],
 ) -> dict:
@@ -137,17 +142,14 @@ async def _analyze_results(
         sample_comments=sample_comments,
     )
 
-    response = await client.messages.create(
-        model=settings.analysis_model,
+    response = await client.chat.completions.create(
+        model=settings.llm_analysis_model,
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-
-    return json.loads(text)
+    text = response.choices[0].message.content
+    return extract_json(text)
 
 
 async def run_simulation(simulation_id: str, db: AsyncSession):
@@ -164,7 +166,7 @@ async def run_simulation(simulation_id: str, db: AsyncSession):
     }
 
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = _get_client()
 
         # Step 1: Generate personas
         personas = await generate_personas(

@@ -4,12 +4,13 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     app_name: str = "PhantomCrowd"
     debug: bool = False
-    anthropic_api_key: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/phantomcrowd.db"
 
-    # Model configuration
-    persona_model: str = "claude-haiku-4-5-20251001"
-    analysis_model: str = "claude-sonnet-4-5-20241022"
+    # LLM configuration (OpenAI-compatible)
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = "gpt-4o-mini"
+    llm_analysis_model: str = "gpt-4o"
 
     # Simulation defaults
     default_audience_size: int = 50
