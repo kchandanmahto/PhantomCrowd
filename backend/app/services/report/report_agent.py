@@ -1,7 +1,10 @@
 """ReportAgent with ReACT pattern: Plan → Search → Write → Reflect per section."""
 
 import json
+import logging
 from collections import Counter
+
+logger = logging.getLogger(__name__)
 
 from openai import AsyncOpenAI
 from app.core.config import settings
@@ -247,7 +250,7 @@ async def generate_report(
             if score < 7 and reflect_data.get("revised"):
                 section_content = reflect_data["revised"]
         except Exception:
-            pass  # Reflection failed, keep original
+            logger.warning("Reflection failed for section '%s', keeping original", title, exc_info=True)
 
         completed_sections.append({"title": title, "content": section_content})
 

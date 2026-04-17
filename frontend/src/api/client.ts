@@ -210,3 +210,38 @@ export const uploadCampaignFile = (id: string, file: File) => {
   formData.append('file', file)
   return api.post<{ filename: string; chars: number; preview: string }>(`/v2/campaigns/${id}/upload`, formData)
 }
+
+// WebSocket for real-time campaign updates
+export function connectCampaignWs(
+  campaignId: string,
+  onMessage: (event: CampaignWsEvent) => void,
+  onClose?: () => void,
+): WebSocket {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const ws = new WebSocket(`${protocol}//${window.location.host}/ws/campaigns/${campaignId}`)
+  ws.onmessage = (e) => {
+    try {
+      onMessage(JSON.parse(e.data))
+    } catch {}
+  }
+  ws.onclose = () => onClose?.()
+  return ws
+}
+
+export interface CampaignWsEvent {
+  type: 'status' | 'round' | 'action'
+  status?: string
+  viral_score?: number
+  graph_stats?: { nodes: number; edges: number }
+  error?: string
+  current_round?: number
+  total_rounds?: number
+  actions_count?: number
+  round?: number
+  agent?: string
+  action_type?: string
+  content?: string
+  sentiment?: string
+  score?: number
+  target?: string
+}

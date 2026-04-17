@@ -219,8 +219,8 @@ import { useRoute } from 'vue-router'
 import * as d3 from 'd3'
 import {
   getCampaign, getCampaignGraph, getCampaignSimStatus, getCampaignActions,
-  interviewAgent as apiInterview,
-  type Campaign, type GraphData, type SimStatus, type SimActionItem,
+  interviewAgent as apiInterview, connectCampaignWs,
+  type Campaign, type GraphData, type SimStatus, type SimActionItem, type CampaignWsEvent,
 } from '../api/client'
 
 const route = useRoute()
@@ -267,6 +267,7 @@ const interviewResponse = ref('')
 const interviewing = ref(false)
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+let ws: WebSocket | null = null
 
 const { t } = useI18n()
 
@@ -352,6 +353,59 @@ async function poll() {
 
   if (data.status === 'completed' || data.status === 'failed') {
     if (pollTimer) clearInterval(pollTimer)
+  }
+}
+
+function handleWsEvent(event: CampaignWsEvent) {
+  const id = route.params.id as string
+
+  if (event.type === 'status' && campaign.value) {
+    campaign.value = { ...campaign.value, status: event.status || campaign.value.status }
+    if (event.viral_score != null) {
+      campaign.value.viral_score = event.viral_score
+    }
+    // Fetch full data on key transitions
+    if (event.status === 'graph_ready') {
+      getCampaignGraph(id).then(({ data }) => { graphData.value = data }).catch(() => {})
+    }
+    if (event.status === 'completed') {
+      // Fetch final campaign state with report
+      getCampaign(id).then(({ data }) => { campaign.value = data }).catch(() => {})
+      getCampaignActions(id).then(({ data }) => { actions.value = data }).catch(() => {})
+      ws?.close()
+    }
+    if (event.status === 'failed') {
+      getCampaign(id).then(({ data }) => { campaign.value = data }).catch(() => {})
+      ws?.close()
+    }
+  }
+
+  if (event.type === 'round') {
+    simStatus.value = {
+      campaign_id: id,
+      status: 'running',
+      current_round: event.current_round || 0,
+      total_rounds: event.total_rounds || 0,
+      actions_count: event.actions_count || 0,
+    }
+  }
+
+  if (event.type === 'action') {
+    // Append new action to live feed
+    actions.value = [...actions.value, {
+      round: event.round || 0,
+      agent: event.agent || '',
+      profile: {},
+      action: event.action_type || '',
+      content: event.content || '',
+      target: event.target || '',
+      sentiment: event.sentiment || 'neutral',
+      score: event.score || 0,
+    }]
+    // Update actions count in simStatus
+    if (simStatus.value) {
+      simStatus.value = { ...simStatus.value, actions_count: simStatus.value.actions_count + 1 }
+    }
   }
 }
 
@@ -568,11 +622,25 @@ watch(graphData, async () => {
 onMounted(async () => {
   await poll()
   if (campaign.value && campaign.value.status !== 'completed' && campaign.value.status !== 'failed') {
-    pollTimer = setInterval(poll, 3000)
+    const id = route.params.id as string
+    // Try WebSocket first, fall back to polling
+    try {
+      ws = connectCampaignWs(id, handleWsEvent, () => {
+        // On WS close, fall back to polling if still in progress
+        if (campaign.value && campaign.value.status !== 'completed' && campaign.value.status !== 'failed') {
+          pollTimer = setInterval(poll, 3000)
+        }
+      })
+    } catch {
+      pollTimer = setInterval(poll, 3000)
+    }
   }
 })
 
-onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+  if (ws) { ws.close(); ws = null }
+})
 </script>
 
 <style scoped>

@@ -9,6 +9,7 @@ from camel.models import ModelFactory
 from camel.types import ModelPlatformType
 
 from app.core.config import settings
+from app.core.events import publish
 from app.services.simulation_v2.memory import AgentMemory
 
 
@@ -86,13 +87,13 @@ Always respond with a JSON object:
     return ChatAgent(system_message=system_msg, model=model)
 
 
-async def _llm_agent_act(
+def _llm_agent_act(
     agent: ChatAgent,
     profile: AgentProfile,
     round_num: int,
     feed: list[Action],
 ) -> Action:
-    """Have a full LLM agent take an action."""
+    """Have a full LLM agent take an action (sync — runs in thread)."""
     # Build the feed context
     if feed:
         recent = feed[-10:]  # Last 10 actions
@@ -306,6 +307,12 @@ async def run_simulation(
             simulation_states[campaign_id]["current_round"] = round_num
             round_actions: list[Action] = []
 
+            await publish(campaign_id, "round", {
+                "current_round": round_num,
+                "total_rounds": num_rounds,
+                "actions_count": simulation_states[campaign_id]["actions_count"],
+            })
+
             # Build crowd pulse from previous round's rule-based actions
             crowd_pulse = _build_crowd_pulse(prev_rule_actions, all_actions, round_num)
 
@@ -321,9 +328,7 @@ async def run_simulation(
                 )
                 agent = agents[profile.name]
                 action = await asyncio.to_thread(
-                    lambda p=profile, a=agent: asyncio.run(
-                        _llm_agent_act(a, p, round_num, all_actions)
-                    )
+                    _llm_agent_act, agent, profile, round_num, all_actions
                 )
 
                 # Update memory
@@ -335,6 +340,16 @@ async def run_simulation(
 
                 round_actions.append(action)
                 simulation_states[campaign_id]["actions_count"] += 1
+
+                await publish(campaign_id, "action", {
+                    "round": round_num,
+                    "agent": action.agent_name,
+                    "action_type": action.action_type,
+                    "content": (action.content or "")[:200],
+                    "sentiment": action.sentiment,
+                    "score": action.sentiment_score,
+                    "target": action.target_agent,
+                })
 
             # Rule-based agents act (instant, no LLM)
             current_rule_actions: list[Action] = []
@@ -376,3 +391,8 @@ async def run_simulation(
 
 def get_simulation_state(campaign_id: str) -> dict:
     return simulation_states.get(campaign_id, {"status": "unknown"})
+
+
+def cleanup_simulation_state(campaign_id: str) -> None:
+    """Remove completed simulation state to prevent memory leak."""
+    simulation_states.pop(campaign_id, None)

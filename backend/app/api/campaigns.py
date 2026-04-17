@@ -19,10 +19,11 @@ from app.services.knowledge.graph_updater import update_graph_with_actions
 from app.services.simulation_v2.profile_generator import generate_profiles
 from app.services.simulation_v2.config_generator import generate_sim_config
 from app.services.simulation_v2.engine import (
-    run_simulation, get_simulation_state, Action,
+    run_simulation, get_simulation_state, cleanup_simulation_state, Action,
 )
 from app.services.report.report_agent import generate_report, interview_agent
 from app.services.controversy_detector import detect_controversy, build_controversy_context
+from app.core.events import publish
 
 router = APIRouter(prefix="/v2/campaigns", tags=["campaigns-v2"])
 
@@ -81,23 +82,61 @@ class InterviewRequest(BaseModel):
 
 # --- Background tasks ---
 
-async def _run_campaign_pipeline(campaign_id: str):
-    """Full pipeline: build graph → generate profiles → simulate → report."""
+async def _update_campaign(campaign_id: str, **fields) -> None:
+    """Update campaign fields with a short-lived session and retry on lock."""
+    for attempt in range(3):
+        try:
+            async with async_session() as db:
+                campaign = await db.get(Campaign, campaign_id)
+                if not campaign:
+                    return
+                for k, v in fields.items():
+                    setattr(campaign, k, v)
+                await db.commit()
+                return
+        except Exception as e:
+            logger.warning("_update_campaign attempt %d failed: %s", attempt + 1, e)
+            await asyncio.sleep(1)
+    logger.error("_update_campaign failed after 3 attempts for %s", campaign_id)
+
+
+
+async def _get_campaign_data(campaign_id: str) -> dict | None:
+    """Read campaign data with a short-lived session."""
     async with async_session() as db:
         campaign = await db.get(Campaign, campaign_id)
         if not campaign:
-            return
+            return None
+        return {
+            "content": campaign.content,
+            "content_type": campaign.content_type,
+            "context_text": campaign.context_text,
+            "audience_config": campaign.audience_config,
+            "language": campaign.language,
+            "llm_agents": campaign.llm_agents,
+            "rule_agents": campaign.rule_agents,
+            "sim_rounds": campaign.sim_rounds,
+            "graph_dir": campaign.graph_dir,
+        }
 
-        try:
-            # Step 1: Build knowledge graph
-            campaign.status = "graph_building"
-            await db.commit()
 
-            builder = GraphBuilder(campaign_id)
-            await builder.initialize()
-            graph_data = await builder.build_graph(campaign.content, campaign.context_text)
+async def _run_campaign_pipeline(campaign_id: str):
+    """Full pipeline: build graph → generate profiles → simulate → report."""
+    data = await _get_campaign_data(campaign_id)
+    if not data:
+        return
 
-            # Save entities to DB
+    try:
+        # Step 1: Build knowledge graph
+        await _update_campaign(campaign_id, status="graph_building")
+        await publish(campaign_id, "status", {"status": "graph_building"})
+
+        builder = GraphBuilder(campaign_id)
+        await builder.initialize()
+        graph_data = await builder.build_graph(data["content"], data["context_text"])
+
+        # Save entities to DB
+        async with async_session() as db:
             for node in graph_data["nodes"]:
                 entity = CampaignEntity(
                     campaign_id=campaign_id,
@@ -108,87 +147,93 @@ async def _run_campaign_pipeline(campaign_id: str):
                 db.add(entity)
             await db.commit()
 
-            campaign.status = "graph_ready"
-            campaign.graph_dir = builder.working_dir
-            await db.commit()
+        await _update_campaign(campaign_id, status="graph_ready", graph_dir=builder.working_dir)
+        await publish(campaign_id, "status", {
+            "status": "graph_ready",
+            "graph_stats": graph_data["stats"],
+        })
 
-            # Get graph context + entity list for agents
-            graph_context = await builder.query(
-                f"Summarize all key entities and relationships about: {campaign.content[:200]}",
-                mode="hybrid",
+        # Get graph context + entity list for agents
+        graph_context = await builder.query(
+            f"Summarize all key entities and relationships about: {data['content'][:200]}",
+            mode="hybrid",
+        )
+        if not graph_context:
+            graph_context = "No additional context available."
+
+        graph_entities = builder.get_entities()
+
+        # Step 1.5: Generate ontology (for metadata)
+        try:
+            ontology = await generate_ontology(
+                data["content"],
+                data["context_text"] or "",
+                "marketing audience simulation",
             )
-            if not graph_context:
-                graph_context = "No additional context available."
+            logger.info("[%s] Ontology generated", campaign_id[:8])
+        except Exception:
+            logger.warning("[%s] Ontology generation failed, skipping", campaign_id[:8], exc_info=True)
+            ontology = None
 
-            graph_entities = builder.get_entities()
+        # Step 2: Generate profiles (graph-grounded)
+        logger.info("[%s] Starting profile generation", campaign_id[:8])
+        await _update_campaign(campaign_id, status="generating_profiles")
+        await publish(campaign_id, "status", {"status": "generating_profiles"})
 
-            # Step 1.5: Generate ontology (for metadata)
-            try:
-                ontology = await generate_ontology(
-                    campaign.content,
-                    campaign.context_text or "",
-                    "marketing audience simulation",
-                )
-            except Exception:
-                ontology = None
+        llm_profiles, rule_profiles = await generate_profiles(
+            content=data["content"],
+            graph_context=graph_context,
+            llm_count=data["llm_agents"],
+            rule_count=data["rule_agents"],
+            audience_config=data["audience_config"],
+            language=data["language"],
+            graph_entities=graph_entities,
+        )
 
-            # Step 2: Generate profiles (graph-grounded)
-            campaign.status = "generating_profiles"
-            await db.commit()
-
-            llm_profiles, rule_profiles = await generate_profiles(
-                content=campaign.content,
-                graph_context=graph_context,
-                llm_count=campaign.llm_agents,
-                rule_count=campaign.rule_agents,
-                audience_config=campaign.audience_config,
-                language=campaign.language,
-                graph_entities=graph_entities,
+        # Step 2.5: Auto-generate simulation config
+        try:
+            sim_config = await generate_sim_config(
+                content=data["content"],
+                entity_count=graph_data["stats"]["nodes"],
+                edge_count=graph_data["stats"]["edges"],
+                key_entities=[e["label"] for e in graph_entities[:10]],
+                language=data["language"],
             )
+        except Exception:
+            sim_config = None
 
-            # Step 2.5: Auto-generate simulation config
-            try:
-                sim_config = await generate_sim_config(
-                    content=campaign.content,
-                    entity_count=graph_data["stats"]["nodes"],
-                    edge_count=graph_data["stats"]["edges"],
-                    key_entities=[e["label"] for e in graph_entities[:10]],
-                    language=campaign.language,
-                )
-            except Exception:
-                sim_config = None
+        # Step 2.7: Controversy Detection (pre-scan)
+        controversy = await detect_controversy(
+            content=data["content"],
+            content_type=data["content_type"],
+            language=data["language"],
+            context=data["context_text"] or "",
+        )
+        logger.info(
+            "Controversy detection result: has=%s risk=%s penalty=%s",
+            controversy.get("has_controversy"),
+            controversy.get("overall_risk"),
+            controversy.get("total_score_penalty"),
+        )
+        controversy_context = build_controversy_context(controversy)
+        if controversy_context:
+            graph_context = graph_context + "\n" + controversy_context
 
-            # Step 2.7: Controversy Detection (pre-scan)
-            controversy = await detect_controversy(
-                content=campaign.content,
-                content_type=campaign.content_type,
-                language=campaign.language,
-                context=campaign.context_text or "",
-            )
-            logger.info(
-                "Controversy detection result: has=%s risk=%s penalty=%s",
-                controversy.get("has_controversy"),
-                controversy.get("overall_risk"),
-                controversy.get("total_score_penalty"),
-            )
-            controversy_context = build_controversy_context(controversy)
-            if controversy_context:
-                graph_context = graph_context + "\n" + controversy_context
+        # Step 3: Run simulation
+        await _update_campaign(campaign_id, status="simulating")
+        await publish(campaign_id, "status", {"status": "simulating"})
 
-            # Step 3: Run simulation
-            campaign.status = "simulating"
-            await db.commit()
+        actions = await run_simulation(
+            campaign_id=campaign_id,
+            content=data["content"],
+            graph_context=graph_context,
+            llm_profiles=llm_profiles,
+            rule_profiles=rule_profiles,
+            num_rounds=data["sim_rounds"],
+        )
 
-            actions = await run_simulation(
-                campaign_id=campaign_id,
-                content=campaign.content,
-                graph_context=graph_context,
-                llm_profiles=llm_profiles,
-                rule_profiles=rule_profiles,
-                num_rounds=campaign.sim_rounds,
-            )
-
-            # Save actions to DB
+        # Save actions to DB
+        async with async_session() as db:
             for action in actions:
                 sa = SimAction(
                     campaign_id=campaign_id,
@@ -205,49 +250,59 @@ async def _run_campaign_pipeline(campaign_id: str):
                 db.add(sa)
             await db.commit()
 
-            # Step 3.5: Feedback loop — update graph with simulation results
-            if campaign.graph_dir:
-                try:
-                    update_graph_with_actions(campaign.graph_dir, actions)
-                except Exception:
-                    pass
-
-            # Step 4: Generate report
-            campaign.status = "reporting"
-            await db.commit()
-
-            report = await generate_report(
-                content=campaign.content,
-                actions=actions,
-                graph_context=graph_context,
-                language=campaign.language,
-            )
-
-            # Apply controversy penalty to viral score
-            raw_score = report.get("viral_score", 50)
-            penalty = controversy.get("total_score_penalty", 0)
-            if penalty > 0:
-                report["viral_score"] = max(5, raw_score - penalty)
-                report["controversy"] = controversy
-                logger.info("Applied controversy penalty: %s -> %s (-%s)", raw_score, report["viral_score"], penalty)
-            else:
-                logger.info("No controversy penalty (raw score: %s)", raw_score)
-
-            campaign.viral_score = report.get("viral_score")
-            campaign.summary = report.get("summary")
-            campaign.report = report
-            campaign.status = "completed"
-            campaign.completed_at = datetime.utcnow()
-            await db.commit()
-
-        except Exception as e:
+        # Step 3.5: Feedback loop — update graph with simulation results
+        if data["graph_dir"]:
             try:
-                await db.rollback()
+                update_graph_with_actions(data["graph_dir"], actions)
             except Exception:
                 pass
-            campaign.status = "failed"
-            campaign.summary = str(e)[:500]
-            await db.commit()
+
+        # Step 4: Generate report
+        await _update_campaign(campaign_id, status="reporting")
+        await publish(campaign_id, "status", {"status": "reporting"})
+
+        report = await generate_report(
+            content=data["content"],
+            actions=actions,
+            graph_context=graph_context,
+            language=data["language"],
+        )
+
+        # Apply controversy penalty to viral score
+        raw_score = report.get("viral_score", 50)
+        penalty = controversy.get("total_score_penalty", 0)
+        if penalty > 0:
+            report["viral_score"] = max(5, raw_score - penalty)
+            report["controversy"] = controversy
+            logger.info("Applied controversy penalty: %s -> %s (-%s)", raw_score, report["viral_score"], penalty)
+        else:
+            logger.info("No controversy penalty (raw score: %s)", raw_score)
+
+        await _update_campaign(
+            campaign_id,
+            status="completed",
+            viral_score=report.get("viral_score"),
+            summary=report.get("summary"),
+            report=report,
+            completed_at=datetime.utcnow(),
+        )
+        await publish(campaign_id, "status", {
+            "status": "completed",
+            "viral_score": report.get("viral_score"),
+        })
+
+    except Exception as e:
+        logger.exception("Campaign pipeline failed for %s", campaign_id)
+        await _update_campaign(campaign_id, status="failed", summary=str(e)[:500])
+        await publish(campaign_id, "status", {
+            "status": "failed", "error": str(e)[:200],
+        })
+    finally:
+        cleanup_simulation_state(campaign_id)
+
+
+# Keep references to background tasks so they don't get garbage collected
+_background_tasks: set[asyncio.Task] = set()
 
 
 # --- Routes ---
@@ -269,8 +324,10 @@ async def create_campaign(req: CampaignCreate, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(campaign)
 
-    # Start pipeline in background
-    asyncio.create_task(_run_campaign_pipeline(campaign.id))
+    # Start pipeline in background — must keep reference to prevent GC
+    task = asyncio.create_task(_run_campaign_pipeline(campaign.id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return campaign
 
